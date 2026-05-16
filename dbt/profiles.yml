@@ -1,0 +1,8 @@
+# dbt/profiles.yml
+crypto_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: /opt/airflow/data/warehouse/crypto.duckdb
+      threads: 4

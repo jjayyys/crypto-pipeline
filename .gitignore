@@ -1,0 +1,21 @@
+# Data
+data/warehouse/*.duckdb
+data/temp/
+
+# Airflow
+airflow/logs/
+airflow/plugins/__pycache__/
+
+# Python
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+.venv/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+
+# OS
+.DS_Store

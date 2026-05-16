@@ -1,0 +1,25 @@
+# dbt/dbt_project.yml
+name: 'crypto_pipeline'
+version: '1.0.0'
+config-version: 2
+
+profile: 'crypto_pipeline'
+
+model-paths: ["models"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  crypto_pipeline:
+    staging:
+      +schema: silver
+      +materialized: view
+    intermediate:
+      +schema: silver
+      +materialized: table
+    mart:
+      +schema: gold
+      +materialized: table
