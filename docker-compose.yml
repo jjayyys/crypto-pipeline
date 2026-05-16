@@ -1,8 +1,9 @@
-# docker-compose.yml
 version: '3.8'
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.9.1-python3.11
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
   env_file: .env
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -16,9 +17,10 @@ x-airflow-common: &airflow-common
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
-    - ./ingestion:/opt/airflow/ingestion       # shared ingestion scripts
-    - ./dbt:/opt/airflow/dbt                   # shared dbt project
-    - ./data:/opt/airflow/data                 # shared DuckDB + temp
+    - ./ingestion:/opt/airflow/ingestion
+    - ./dbt:/opt/airflow/dbt
+    - ./data/raw:/opt/airflow/data/raw        # ← CSV files
+    - data_volume:/opt/airflow/data/warehouse  # ← DuckDB
   depends_on:
     postgres:
       condition: service_healthy
@@ -27,7 +29,6 @@ x-airflow-common: &airflow-common
 
 services:
 
-  # ─── PostgreSQL (Airflow Metadata) ────────────────────────────
   postgres:
     image: postgres:15
     environment:
@@ -44,7 +45,6 @@ services:
     networks:
       - crypto-net
 
-  # ─── MinIO (Data Lake) ────────────────────────────────────────
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -52,8 +52,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     ports:
-      - "9000:9000"   # API
-      - "9001:9001"   # Console UI
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -64,7 +64,6 @@ services:
     networks:
       - crypto-net
 
-  # ─── MinIO Init (สร้าง Bucket อัตโนมัติ) ─────────────────────
   minio-init:
     image: minio/mc:latest
     depends_on:
@@ -74,15 +73,11 @@ services:
       /bin/sh -c "
       mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
       mc mb local/crypto-lake --ignore-existing;
-      mc mb local/crypto-lake/bronze --ignore-existing;
-      mc mb local/crypto-lake/silver --ignore-existing;
-      mc mb local/crypto-lake/gold --ignore-existing;
-      echo 'Buckets created successfully';
+      echo 'Buckets ready';
       "
     networks:
       - crypto-net
 
-  # ─── Airflow Init ─────────────────────────────────────────────
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
@@ -98,10 +93,7 @@ services:
           --role Admin \
           --email admin@example.com
         echo "Airflow initialized"
-    networks:
-      - crypto-net
 
-  # ─── Airflow Webserver ────────────────────────────────────────
   airflow-webserver:
     <<: *airflow-common
     command: webserver
@@ -115,7 +107,6 @@ services:
       start_period: 30s
     restart: always
 
-  # ─── Airflow Scheduler ────────────────────────────────────────
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
@@ -124,6 +115,7 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  data_volume:        # ← named volume แทน bind mount
 
 networks:
   crypto-net:

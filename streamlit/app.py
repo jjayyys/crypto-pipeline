@@ -1,70 +1,79 @@
 # streamlit/app.py
 import streamlit as st
 import duckdb
-import os
 from pathlib import Path
+import sys
+sys.path.append(str(Path(__file__).resolve().parent))
+from connection import get_connection, get_gold_schema, table_exists
 
 st.set_page_config(
-    page_title="Crypto Analytics Platform",
+    page_title="Crypto Analytics",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("📈 Crypto Analytics Platform")
-st.markdown("""
-**Data Pipeline**: CoinGecko API → MinIO (Bronze/Silver) → DuckDB (Gold) → Dashboard
-
-Navigate using the sidebar 👈
-""")
-
-
-# ── Quick KPIs from Gold layer ──────────────────────────────────────────────
-import duckdb
-import os
-
-BASE_DIR = Path(__file__).resolve().parent.parent  # crypto-pipeline/
+BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH  = BASE_DIR / "data" / "warehouse" / "crypto.duckdb"
 
-st.caption(f"🗄️ DB Path: `{DB_PATH}`")
-st.caption(f"📁 Exists: `{DB_PATH.exists()}`")
-
-@st.cache_resource
-def get_connection():
-    # สร้าง folder ถ้าไม่มี
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return duckdb.connect(str(DB_PATH))
+st.title("📈 Crypto Analytics Platform")
+st.caption("BTC · ETH · SOL — Historical Price Analysis")
 
 try:
     con = get_connection()
-    st.success("✅ Connected to DuckDB")
 except Exception as e:
-    st.error(f"❌ Database Error: {e}")
+    st.error(f"❌ Cannot connect: {e}")
     st.stop()
 
-col1, col2, col3, col4 = st.columns(4)
+# ── หา schema จริงที่ dbt สร้าง ──────────────────────────────
+gold_schema = get_gold_schema(con)
 
-with col1:
-    total_records = con.execute(
-        "SELECT COUNT(*) FROM gold.fact_price_ohlcv"
-    ).fetchone()
-    st.metric("Total Price Records", f"{total_records:,}")
+if not gold_schema:
+    st.warning("""
+        ⚠️ ยังไม่มีข้อมูล กรุณารัน:
+        ```bash
+        python scripts/load_local_data.py
+        cd dbt && dbt run
+        ```
+    """)
+    with st.expander("🔍 Debug Info"):
+        try:
+            schemas = con.execute("""
+                SELECT DISTINCT table_schema, table_name
+                FROM information_schema.tables
+                ORDER BY table_schema, table_name
+            """).df()
+            st.dataframe(schemas)
+        except Exception as e:
+            st.error(str(e))
+    st.stop()
 
-with col2:
-    total_coins = con.execute(
-        "SELECT COUNT(*) FROM gold.dim_coin"
-    ).fetchone()
-    st.metric("Coins Tracked", total_coins)
+st.caption(f"📂 Schema: `{gold_schema}`")
 
-with col3:
-    latest_date = con.execute(
-        "SELECT MAX(date) FROM gold.dim_date d "
-        "JOIN gold.fact_price_ohlcv f ON d.date_id = f.date_id"
-    ).fetchone()
-    st.metric("Latest Data Date", str(latest_date))
+# ── KPI Cards ─────────────────────────────────────────────────
+try:
+    col1, col2, col3 = st.columns(3)
 
-with col4:
-    avg_sentiment = con.execute(
-        "SELECT ROUND(AVG(fear_greed_value), 1) FROM gold.fact_price_ohlcv "
-        "WHERE fear_greed_value IS NOT NULL"
-    ).fetchone()
-    st.metric("Avg Fear & Greed", avg_sentiment)
+    with col1:
+        n = con.execute(
+            f"SELECT COUNT(*) FROM {gold_schema}.fact_price_ohlcv"
+        ).fetchone()[0]
+        st.metric("Total Records", f"{n:,}")
+
+    with col2:
+        coins = con.execute(f"""
+            SELECT COUNT(DISTINCT coin_sk)
+            FROM {gold_schema}.fact_price_ohlcv
+        """).fetchone()[0]
+        st.metric("Coins Tracked", coins)
+
+    with col3:
+        latest = con.execute(f"""
+            SELECT MAX(d.date)
+            FROM {gold_schema}.dim_date d
+            JOIN {gold_schema}.fact_price_ohlcv f
+              ON d.date_id = f.date_id
+        """).fetchone()[0]
+        st.metric("Latest Date", str(latest))
+
+except Exception as e:
+    st.error(f"❌ Query Error: {e}")

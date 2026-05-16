@@ -1,229 +1,252 @@
 # airflow/dags/ingestion_historical_dag.py
-"""
-DAG: Historical Ingestion (Run Once / Backfill)
-- ดึง 1 ปีย้อนหลังของ OHLCV, Market Index, Fear&Greed
-- เขียนลง MinIO Bronze Layer
-- Transform → Silver (DuckDB)
-- Load → Gold / Star Schema (DuckDB)
-"""
-
 from __future__ import annotations
-
 from datetime import datetime, timedelta
-
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
 
-# ── Default args ──────────────────────────────────────────────────────────────
 default_args = {
     "owner": "data-engineer",
     "depends_on_past": False,
-    "retries": 2,
-    "retry_delay": timedelta(minutes=5),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=2),
     "email_on_failure": False,
 }
 
-# ── Task functions ─────────────────────────────────────────────────────────────
+def count_rows(con, table: str) -> int:
+    """Helper: นับ rows และ return int เสมอ"""
+    return con.execute(
+        f"SELECT COUNT(*) FROM {table}"
+    ).fetchone()[0]
 
-def extract_ohlcv_historical(**context):
-    """Extract 1-year OHLCV from CoinGecko → Bronze (MinIO)"""
-    from ingestion.coingecko import fetch_historical_ohlcv, COINS
-    from ingestion.minio_client import upload_json_gz
-    import time
-
-    uploaded = []
-    for coin in COINS:
-        data = fetch_historical_ohlcv(coin_id=coin["id"], days=365)
-        if data:
-            key = upload_json_gz(
-                data=data,
-                layer="bronze",
-                source="coingecko",
-                entity="ohlcv",
-            )
-            uploaded.append(key)
-            context["ti"].log.info(f"✅ {coin['id']} → {key}")
-        time.sleep(2)   # rate limit
-
-    # Push keys to XCom for downstream tasks
-    context["ti"].xcom_push(key="ohlcv_keys", value=uploaded)
-
-
-def extract_coin_metadata(**context):
-    """Extract coin metadata → Bronze (MinIO)"""
-    from ingestion.coingecko import fetch_coin_metadata, COINS
-    from ingestion.minio_client import upload_json_gz
-    import time
-
-    uploaded = []
-    for coin in COINS:
-        data = fetch_coin_metadata(coin_id=coin["id"])
-        if data:
-            key = upload_json_gz(
-                data=data,
-                layer="bronze",
-                source="coingecko",
-                entity="metadata",
-            )
-            uploaded.append(key)
-        time.sleep(2)
-
-    context["ti"].xcom_push(key="metadata_keys", value=uploaded)
-
-
-def extract_fear_greed_historical(**context):
-    """Extract 365 days of Fear & Greed → Bronze (MinIO)"""
-    from ingestion.fear_greed import fetch_fear_greed_index
-    from ingestion.minio_client import upload_json_gz
-
-    data = fetch_fear_greed_index(limit=365)
-    if data:
-        key = upload_json_gz(
-            data=data,
-            layer="bronze",
-            source="fear_greed",
-            entity="sentiment",
-        )
-        context["ti"].xcom_push(key="sentiment_key", value=key)
-
-
-def extract_market_indices(**context):
-    """Extract 1-year Market Index from Yahoo Finance → Bronze (MinIO)"""
-    from ingestion.yfinance_connector import fetch_index_history, INDICES
-    from ingestion.minio_client import upload_json_gz
-
-    uploaded = []
-    for ticker in INDICES:
-        data = fetch_index_history(ticker=ticker, period="1y")
-        if data:
-            key = upload_json_gz(
-                data=data,
-                layer="bronze",
-                source="yfinance",
-                entity="market_index",
-            )
-            uploaded.append(key)
-
-    context["ti"].xcom_push(key="index_keys", value=uploaded)
-
-
-def transform_bronze_to_silver(**context):
-    """
-    Read from Bronze (MinIO JSON.gz) → Clean & Normalize → Write Silver (DuckDB)
-    """
+def load_ohlcv_to_silver(**context):
     import duckdb
-    import json
-    import gzip
+    import pandas as pd
     import os
-    from ingestion.minio_client import get_s3_client, list_objects, BUCKET
+    from pathlib import Path
+    from datetime import datetime, timezone
 
-    db_path = os.getenv("DUCKDB_PATH", "/opt/airflow/data/warehouse/crypto.duckdb")
-    s3 = get_s3_client()
+    db_path = os.getenv(
+        "DUCKDB_PATH",
+        "/opt/airflow/data/warehouse/crypto.duckdb"
+    )
+    raw_dir = Path("/opt/airflow/data/raw")
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    COIN_FILES = {
+        "bitcoin":  "bitcoin.csv",
+        "ethereum": "ethereum.csv",
+        "solana":   "solana.csv",
+    }
+
+    all_ohlcv = []
+    for coin_id, filename in COIN_FILES.items():
+        filepath = raw_dir / filename
+        if not filepath.exists():
+            context["ti"].log.warning(f"Missing: {filepath}")
+            continue
+
+        df = pd.read_csv(str(filepath))
+        df.columns = df.columns.str.strip()
+        context["ti"].log.info(
+            f"{filename} columns: {list(df.columns)}"
+        )
+
+        # หา columns อัตโนมัติ
+        col_map = {}
+        for col in df.columns:
+            cl = col.lower()
+            if "date" in cl:
+                col_map[col] = "date"
+            elif cl == "open":
+                col_map[col] = "open"
+            elif cl == "high":
+                col_map[col] = "high"
+            elif cl == "low":
+                col_map[col] = "low"
+            elif cl == "close" and "adj" not in cl:
+                col_map[col] = "close"
+
+        df = df.rename(columns=col_map)
+
+        required = ["date", "open", "high", "low", "close"]
+        missing  = [c for c in required if c not in df.columns]
+        if missing:
+            context["ti"].log.error(
+                f"{filename}: missing columns {missing}"
+            )
+            continue
+
+        df["date"] = pd.to_datetime(
+            df["date"]
+        ).dt.strftime("%Y-%m-%d")
+
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna(subset=required)
+        df = df[required].copy()
+        df["coin_id"]      = coin_id
+        df["source"]       = "local_csv"
+        df["extracted_at"] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        df = df.sort_values("date")
+        all_ohlcv.append(df)
+
+        context["ti"].log.info(
+            f"✅ {coin_id}: {len(df):,} rows "
+            f"({df['date'].min()} → {df['date'].max()})"
+        )
+
+    if not all_ohlcv:
+        raise ValueError(
+            "No OHLCV data! ตรวจสอบ CSV ใน /opt/airflow/data/raw/"
+        )
+
+    df_all = pd.concat(all_ohlcv, ignore_index=True)
+    df_all = df_all.drop_duplicates(subset=["coin_id", "date"])
+
     con = duckdb.connect(db_path)
-
-    # ── Install & Load httpfs for S3 access ──────────────────────
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute(f"""
-        SET s3_endpoint='minio:9000';
-        SET s3_access_key_id='minioadmin';
-        SET s3_secret_access_key='minioadmin123';
-        SET s3_use_ssl=false;
-        SET s3_url_style='path';
+    con.execute("CREATE SCHEMA IF NOT EXISTS silver;")
+    con.execute("""
+        CREATE OR REPLACE TABLE silver.ohlcv AS
+        SELECT * FROM df_all
     """)
 
-    # ── Create Silver Schema ──────────────────────────────────────
+    row_count = count_rows(con, "silver.ohlcv")
+    context["ti"].log.info(f"✅ silver.ohlcv: {row_count:,} rows")
+
+
+def load_metadata_to_silver(**context):
+    import duckdb
+    import pandas as pd
+    import os
+    from datetime import datetime, timezone
+
+    db_path = os.getenv(
+        "DUCKDB_PATH",
+        "/opt/airflow/data/warehouse/crypto.duckdb"
+    )
+
+    COIN_META = [
+        {
+            "coin_id":           "bitcoin",
+            "symbol":            "BTC",
+            "name":              "Bitcoin",
+            "categories":        "['Cryptocurrency', 'Layer 1']",
+            "genesis_date":      "2009-01-03",
+            "hashing_algorithm": "SHA-256",
+        },
+        {
+            "coin_id":           "ethereum",
+            "symbol":            "ETH",
+            "name":              "Ethereum",
+            "categories":        "['Cryptocurrency', 'Smart Contract']",
+            "genesis_date":      "2015-07-30",
+            "hashing_algorithm": "Ethash",
+        },
+        {
+            "coin_id":           "solana",
+            "symbol":            "SOL",
+            "name":              "Solana",
+            "categories":        "['Cryptocurrency', 'Layer 1']",
+            "genesis_date":      "2020-03-16",
+            "hashing_algorithm": "PoH",
+        },
+    ]
+
+    df = pd.DataFrame(COIN_META)
+    df["extracted_at"] = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    # ── แก้ Bug 2: connect หลังจาก load_ohlcv ปิด con แล้ว ───
+    con = duckdb.connect(db_path)
     con.execute("CREATE SCHEMA IF NOT EXISTS silver;")
-
-    # ── Transform OHLCV ──────────────────────────────────────────
-    ohlcv_keys = context["ti"].xcom_pull(
-        task_ids="extract_ohlcv_historical",
-        key="ohlcv_keys"
-    ) or []
-
-    ohlcv_rows = []
-    for key in ohlcv_keys:
-        resp = s3.get_object(Bucket=BUCKET, Key=key)
-        raw = json.loads(gzip.decompress(resp["Body"].read()))
-
-        coin_id     = raw["coin_id"]
-        extracted   = raw["extracted_at"]
-
-        for row in raw["data"]:  # [timestamp_ms, open, high, low, close]
-            ts_ms = row
-            date  = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
-            ohlcv_rows.append({
-                "coin_id":       coin_id,
-                "date":          date,
-                "open":          row,
-                "high":          row,
-                "low":           row,
-                "close":         row,
-                "source":        "coingecko",
-                "extracted_at":  extracted,
-            })
-
-    if ohlcv_rows:
-        import pandas as pd
-        df = pd.DataFrame(ohlcv_rows).drop_duplicates(subset=["coin_id", "date"])
-        con.execute("""
-            CREATE OR REPLACE TABLE silver.ohlcv AS
-            SELECT * FROM df
-        """)
-        context["ti"].log.info(f"✅ Silver OHLCV: {len(df):,} rows")
-
+    con.execute("""
+        CREATE OR REPLACE TABLE silver.coin_metadata AS
+        SELECT * FROM df
+    """)
+    context["ti"].log.info(
+        f"✅ silver.coin_metadata: {len(df)} rows"
+    )
     con.close()
 
 
-# ── DAG Definition ────────────────────────────────────────────────────────────
+def verify_silver(**context):
+    import duckdb
+    import os
+
+    db_path = os.getenv(
+        "DUCKDB_PATH",
+        "/opt/airflow/data/warehouse/crypto.duckdb"
+    )
+    con = duckdb.connect(db_path)
+
+    checks = {
+        "silver.ohlcv":         100,
+        "silver.coin_metadata": 1,
+    }
+
+    for table, min_rows in checks.items():
+        try:
+            n = con.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            if n < min_rows:
+                raise ValueError(
+                    f"{table}: {n} rows (ต้องการ >= {min_rows})"
+                )
+            context["ti"].log.info(f"✅ {table}: {n:,} rows")
+        except Exception as e:
+            con.close()
+            raise ValueError(f"❌ {e}")
+
+    con.close()
+    context["ti"].log.info("✅ Silver verification passed!")
+
+
 with DAG(
     dag_id="historical_ingestion",
-    description="Full historical load: CoinGecko + Yahoo Finance + Fear&Greed",
+    description="Load CSV -> Silver -> dbt Gold",
     start_date=datetime(2024, 1, 1),
-    schedule_interval=None,     # Manual trigger only (Backfill)
+    schedule_interval="@daily",
     default_args=default_args,
     catchup=False,
-    tags=["ingestion", "historical", "bronze"],
+    tags=["ingestion", "historical", "csv"],
 ) as dag:
 
-    # ── Extract Tasks (Parallel) ──────────────────────────────────
     t_ohlcv = PythonOperator(
-        task_id="extract_ohlcv_historical",
-        python_callable=extract_ohlcv_historical,
+        task_id="load_ohlcv_to_silver",
+        python_callable=load_ohlcv_to_silver,
     )
 
     t_metadata = PythonOperator(
-        task_id="extract_coin_metadata",
-        python_callable=extract_coin_metadata,
+        task_id="load_metadata_to_silver",
+        python_callable=load_metadata_to_silver,
     )
 
-    t_sentiment = PythonOperator(
-        task_id="extract_fear_greed_historical",
-        python_callable=extract_fear_greed_historical,
+    t_verify = PythonOperator(
+        task_id="verify_silver",
+        python_callable=verify_silver,
     )
 
-    t_indices = PythonOperator(
-        task_id="extract_market_indices",
-        python_callable=extract_market_indices,
-    )
-
-    # ── Transform Bronze → Silver ─────────────────────────────────
-    t_silver = PythonOperator(
-        task_id="transform_bronze_to_silver",
-        python_callable=transform_bronze_to_silver,
-    )
-
-    # ── dbt Run (Silver → Gold / Star Schema) ─────────────────────
     t_dbt_run = BashOperator(
         task_id="dbt_run_all_models",
-        bash_command="cd /opt/airflow/dbt && dbt run --profiles-dir .",
+        bash_command=(
+            "cd /opt/airflow/dbt && "
+            "PYTHONUTF8=1 dbt run --profiles-dir ."
+        ),
     )
 
-    # ── dbt Test ──────────────────────────────────────────────────
     t_dbt_test = BashOperator(
         task_id="dbt_test_all_models",
-        bash_command="cd /opt/airflow/dbt && dbt test --profiles-dir .",
+        bash_command=(
+            "cd /opt/airflow/dbt && "
+            "PYTHONUTF8=1 dbt test --profiles-dir ."
+        ),
     )
 
-    # ── Dependencies ──────────────────────────────────────────────
-    [t_ohlcv, t_metadata, t_sentiment, t_indices] >> t_silver >> t_dbt_run >> t_dbt_test
+    # ── Sequential เพื่อหลีกเลี่ยง DuckDB lock conflict ────────
+    t_ohlcv >> t_metadata >> t_verify >> t_dbt_run >> t_dbt_test

@@ -5,4 +5,5 @@ crypto_pipeline:
     dev:
       type: duckdb
       path: /opt/airflow/data/warehouse/crypto.duckdb
+      schema: main
       threads: 4

@@ -1,0 +1,28 @@
+# Dockerfile.airflow
+FROM apache/airflow:2.9.1-python3.11
+
+USER root
+
+# ติดตั้ง system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# สร้าง data directories และ set permission ให้ airflow user
+RUN mkdir -p /opt/airflow/data/warehouse \
+    && mkdir -p /opt/airflow/data/temp \
+    && chown -R airflow:root /opt/airflow/data \
+    && chmod -R 775 /opt/airflow/data
+
+USER airflow
+
+# ติดตั้ง Python packages
+RUN pip install --no-cache-dir \
+    yfinance==0.2.40 \
+    boto3==1.34.131 \
+    duckdb==1.1.3 \
+    pandas==2.2.2 \
+    requests==2.32.3 \
+    dbt-duckdb==1.8.1 \
+    python-dotenv==1.0.1

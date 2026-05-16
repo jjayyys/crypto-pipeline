@@ -25,11 +25,8 @@ def fetch_historical_ohlcv(
     vs_currency: str = "usd",
     days: int = 365,
 ) -> Optional[dict]:
-    """
-    Fetch historical OHLCV data from CoinGecko.
-    Returns raw dict with metadata.
-    """
-    url = f"{BASE_URL}/coins/{coin_id}/ohlc"
+
+    url    = f"{BASE_URL}/coins/{coin_id}/ohlc"
     params = {"vs_currency": vs_currency, "days": days}
 
     try:
@@ -37,13 +34,22 @@ def fetch_historical_ohlcv(
         response.raise_for_status()
         raw_data = response.json()
 
+        # ── Log sample เพื่อ debug format ──────────────────
+        if raw_data:
+            logger.info(
+                f"{coin_id} OHLCV sample: {raw_data}, "
+                f"type: {type(raw_data)}"
+            )
+
         return {
-            "coin_id": coin_id,
-            "vs_currency": vs_currency,
+            "coin_id":        coin_id,
+            "vs_currency":    vs_currency,
             "days_requested": days,
-            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "extracted_at":   datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"    # ← ไม่มี + ใน format
+            ),
             "source": "coingecko",
-            "data": raw_data,   # [[timestamp, open, high, low, close], ...]
+            "data":   raw_data,
         }
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch OHLCV for {coin_id}: {e}")

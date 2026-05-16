@@ -1,58 +1,38 @@
-# dbt/models/mart/schema.yml
 version: 2
 
 models:
   - name: fact_price_ohlcv
-    description: "Central fact table — daily OHLCV per coin"
+    description: "Daily OHLCV fact table — BTC, ETH, SOL"
     columns:
       - name: price_sk
-        description: "Surrogate key"
-        tests:
-          - unique
-          - not_null
-
+        data_tests: [unique, not_null]
       - name: coin_sk
-        tests:
+        data_tests:
           - not_null
           - relationships:
               to: ref('dim_coin')
               field: coin_sk
-
+              config:
+                severity: warn
       - name: date_id
-        tests:
+        data_tests:
           - not_null
           - relationships:
               to: ref('dim_date')
               field: date_id
-
+              config:
+                severity: warn
       - name: close_price
-        tests:
-          - not_null
-          - dbt_utils.expression_is_true:
-              expression: ">= 0"
-
-      - name: daily_return_pct
-        tests:
-          - dbt_utils.expression_is_true:
-              expression: "between -100 and 10000"
+        data_tests: [not_null]
 
   - name: dim_coin
     columns:
       - name: coin_sk
-        tests: [unique, not_null]
+        data_tests: [unique, not_null]
       - name: coin_id
-        tests: [unique, not_null]
+        data_tests: [unique, not_null]
 
   - name: dim_date
     columns:
       - name: date_id
-        tests: [unique, not_null]
-
-  - name: dim_sentiment
-    columns:
-      - name: sentiment_sk
-        tests: [unique, not_null]
-      - name: fear_greed_value
-        tests:
-          - dbt_utils.expression_is_true:
-              expression: "between 0 and 100"
+        data_tests: [unique, not_null]

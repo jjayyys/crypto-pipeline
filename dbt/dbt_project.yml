@@ -15,11 +15,11 @@ clean-targets: ["target", "dbt_packages"]
 models:
   crypto_pipeline:
     staging:
-      +schema: silver
+      +schema: silver        # → เขียนลง silver schema (ตรงกับ silver.ohlcv)
       +materialized: view
     intermediate:
-      +schema: silver
+      +schema: silver        # → เขียนลง silver schema
       +materialized: table
     mart:
-      +schema: gold
+      +schema: gold          # → เขียนลง gold schema
       +materialized: table

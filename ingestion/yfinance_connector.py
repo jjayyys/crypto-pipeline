@@ -1,5 +1,5 @@
 # ingestion/yfinance_connector.py
-import yfinance as yf
+import requests
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -7,10 +7,10 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 INDICES = {
-    "^GSPC":  "SP500",
-    "^IXIC":  "NASDAQ",
-    "^DJI":   "DOW_JONES",
-    "GC=F":   "GOLD_FUTURES",
+    '^SPX': 'SP500',
+    '^NDX': 'NASDAQ100',
+    '^DJI': 'DOW_JONES',
+    'GC.F': 'GOLD_FUTURES',
 }
 
 
@@ -20,30 +20,47 @@ def fetch_index_history(
     interval: str = "1d",
 ) -> Optional[dict]:
     """
-    Fetch historical data for market indices.
+    ดึง market index จาก stooq.com
+    (ทำงานได้ใน Docker ไม่มี rate limit)
     """
+    url = f"https://stooq.com/q/d/l/?s={ticker}&i=d"
     try:
-        tk = yf.Ticker(ticker)
-        df = tk.history(period=period, interval=interval)
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
 
-        if df.empty:
-            logger.warning(f"No data returned for {ticker}")
+        lines = resp.text.strip().split('\n')
+        if len(lines) < 2:
+            logger.warning(f"No data for {ticker}")
             return None
 
-        df = df.reset_index()
-        df["Date"] = df["Date"].astype(str)
+        rows = []
+        for line in lines[1:]:
+            parts = line.split(',')
+            if len(parts) >= 5:
+                rows.append({
+                    'Date':   parts,
+                    'Open':   float(parts) if parts else None,
+                    'High':   float(parts) if parts else None,
+                    'Low':    float(parts) if parts else None,
+                    'Close':  float(parts) if parts else None,
+                    'Volume': float(parts) if len(parts) > 5
+                              and parts else None,
+                })
+
+        # เอาแค่ 365 วันล่าสุด
+        rows = rows[-365:] if len(rows) > 365 else rows
 
         return {
-            "ticker": ticker,
-            "name": INDICES.get(ticker, ticker),
-            "period": period,
-            "interval": interval,
-            "extracted_at": datetime.now(timezone.utc).isoformat(),
-            "source": "yahoo_finance",
-            "data": df[["Date", "Open", "High", "Low", "Close", "Volume"]].to_dict(
-                orient="records"
+            'ticker':       ticker,
+            'name':         INDICES.get(ticker, ticker),
+            'period':       period,
+            'extracted_at': datetime.now(timezone.utc).strftime(
+                '%Y-%m-%dT%H:%M:%SZ'
             ),
+            'source': 'stooq',
+            'data':   rows,
         }
+
     except Exception as e:
         logger.error(f"Failed to fetch {ticker}: {e}")
         return None

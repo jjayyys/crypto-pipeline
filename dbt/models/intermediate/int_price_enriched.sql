@@ -7,51 +7,42 @@ with prices as (
       and not is_invalid_ohlc
 ),
 
-sentiment as (
-    select * from {{ ref('stg_sentiment') }}
-),
-
-enriched as (
+final as (
     select
-        p.coin_id,
-        p.price_date,
-        p.open_price,
-        p.high_price,
-        p.low_price,
-        p.close_price,
+        coin_id,
+        price_date,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
 
         -- Derived metrics
-        round(p.high_price - p.low_price, 8)                    as daily_range,
-        round((p.close_price - p.open_price) / p.open_price * 100, 4)
-                                                                 as daily_return_pct,
-        round(p.close_price - lag(p.close_price) over (
-            partition by p.coin_id order by p.price_date
-        ), 8)                                                    as price_change,
+        round(high_price - low_price, 8)                as daily_range,
+        round(
+            (close_price - open_price) / open_price * 100,
+        4)                                              as daily_return_pct,
 
-        -- 7-day & 30-day moving average
-        round(avg(p.close_price) over (
-            partition by p.coin_id
-            order by p.price_date
+        round(close_price - lag(close_price) over (
+            partition by coin_id order by price_date
+        ), 8)                                           as price_change,
+
+        -- Moving averages
+        round(avg(close_price) over (
+            partition by coin_id
+            order by price_date
             rows between 6 preceding and current row
-        ), 8)                                                    as ma_7d,
+        ), 8)                                           as ma_7d,
 
-        round(avg(p.close_price) over (
-            partition by p.coin_id
-            order by p.price_date
+        round(avg(close_price) over (
+            partition by coin_id
+            order by price_date
             rows between 29 preceding and current row
-        ), 8)                                                    as ma_30d,
+        ), 8)                                           as ma_30d,
 
-        -- Sentiment
-        s.fear_greed_value,
-        s.classification        as sentiment_classification,
-        s.sentiment_bucket,
+        source,
+        extracted_at
 
-        p.source,
-        p.extracted_at
-
-    from prices p
-    left join sentiment s
-        on p.price_date = s.sentiment_date
+    from prices
 )
 
-select * from enriched
+select * from final
